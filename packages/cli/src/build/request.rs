@@ -322,7 +322,8 @@
 use crate::{
     AndroidTools, AppManifest, BuildContext, BuildId, BundleFormat, DioxusConfig, Error,
     LinkAction, LinkerFlavor, Platform, Renderer, Result, RustcArgs, TargetArgs, TraceSrc,
-    WasmBindgen, WasmOptConfig, Workspace, DX_RUSTC_WRAPPER_ENV_VAR,
+    WasmBindgen, WasmOptConfig, Workspace, WorkspaceRustcArgs, DX_RUSTC_WRAPPER_ENV_VAR,
+    DX_RUSTC_WORKSPACE_WRAPPER_ENV_VAR,
 };
 use anyhow::{bail, Context};
 use cargo_metadata::diagnostic::Diagnostic;
@@ -434,6 +435,8 @@ pub enum BuildMode {
     /// A "thin" build generated with `rustc` directly and dx as a custom linker
     Thin {
         rustc_args: RustcArgs,
+        /// Rustc args for workspace crates, enabling hot-patching of library crates.
+        workspace_rustc_args: WorkspaceRustcArgs,
         changed_files: Vec<PathBuf>,
         aslr_reference: u64,
         cache: Arc<HotpatchModuleCache>,
@@ -451,6 +454,9 @@ pub struct BuildArtifacts {
     pub(crate) root_dir: PathBuf,
     pub(crate) exe: PathBuf,
     pub(crate) direct_rustc: RustcArgs,
+    /// Rustc args for all workspace crates (keyed by crate name).
+    /// This enables hot-patching of library crates, not just the top-level binary.
+    pub(crate) workspace_rustc_args: WorkspaceRustcArgs,
     pub(crate) time_start: SystemTime,
     pub(crate) time_end: SystemTime,
     pub(crate) assets: AssetManifest,
@@ -1022,6 +1028,8 @@ impl BuildRequest {
         _ = std::fs::File::create_new(self.link_err_file());
         _ = std::fs::File::create_new(self.link_args_file());
         _ = std::fs::File::create_new(self.windows_command_file());
+        // Create the directory for workspace crate rustc args
+        _ = std::fs::create_dir_all(self.workspace_rustc_args_dir());
 
         if !matches!(ctx.mode, BuildMode::Thin { .. }) {
             self.prepare_build_dir(ctx)?;
@@ -1132,6 +1140,17 @@ impl BuildRequest {
     /// be very confusing to the user.
     async fn cargo_build(&self, ctx: &BuildContext) -> Result<BuildArtifacts> {
         let time_start = SystemTime::now();
+
+        // For thin builds with workspace crates that have changed files, compile those first
+        if let BuildMode::Thin {
+            workspace_rustc_args,
+            changed_files,
+            ..
+        } = &ctx.mode
+        {
+            self.compile_changed_workspace_crates(ctx, workspace_rustc_args, changed_files)
+                .await?;
+        }
 
         // Extract the unit count of the crate graph so build_cargo has more accurate data
         // "Thin" builds only build the final exe, so we only need to build one crate
@@ -1246,13 +1265,18 @@ impl BuildRequest {
             }
         }
 
-        // Accumulate the rustc args from the wrapper, if they exist and can be parsed.
-        let mut direct_rustc = RustcArgs::default();
-        if let Ok(res) = std::fs::read_to_string(self.rustc_wrapper_args_file()) {
-            if let Ok(res) = serde_json::from_str(&res) {
-                direct_rustc = res;
-            }
-        }
+        // Load workspace crate rustc args (for hot-patching library crates)
+        let workspace_rustc_args =
+            crate::load_workspace_rustc_args(&self.workspace_rustc_args_dir());
+
+        // Get the main binary's rustc args from workspace args (keyed by crate name + type)
+        // The crate name uses underscores instead of hyphens, and the key is {name}_bin
+        let main_crate_name = self.package().name.replace('-', "_");
+        let bin_key = format!("{}_bin", main_crate_name);
+        let mut direct_rustc = workspace_rustc_args
+            .get(&bin_key)
+            .cloned()
+            .unwrap_or_default();
 
         // If there's any warnings from the linker, we should print them out
         if let Ok(linker_warnings) = std::fs::read_to_string(self.link_err_file()) {
@@ -1303,6 +1327,7 @@ impl BuildRequest {
             time_end,
             exe,
             direct_rustc,
+            workspace_rustc_args,
             time_start,
             assets,
             mode,
@@ -1311,6 +1336,133 @@ impl BuildRequest {
             patch_cache: None,
             build_id: ctx.build_id,
         })
+    }
+
+    /// Compile workspace crates that have changed files.
+    ///
+    /// For thin builds, when a library crate in the workspace changes, we need to recompile it
+    /// before recompiling the top-level binary. This enables hot-patching of library code.
+    async fn compile_changed_workspace_crates(
+        &self,
+        ctx: &BuildContext,
+        workspace_rustc_args: &WorkspaceRustcArgs,
+        changed_files: &[PathBuf],
+    ) -> Result<()> {
+        // Find which workspace crates contain the changed files
+        let mut crates_to_compile = std::collections::HashSet::new();
+
+        for file in changed_files {
+            // Try to find which workspace crate this file belongs to
+            for member in self.workspace.krates.workspace_members() {
+                if let krates::Node::Krate { krate, .. } = member {
+                    let crate_dir = krate
+                        .manifest_path
+                        .parent()
+                        .map(|p| p.as_std_path().to_path_buf());
+
+                    if let Some(crate_dir) = crate_dir {
+                        // Check if the file is within this crate's directory
+                        if file.starts_with(&crate_dir) {
+                            // Normalize crate name (replace hyphens with underscores for rustc)
+                            let crate_name = krate.name.replace('-', "_");
+
+                            // Only add if we have rustc args for this crate
+                            // Keys are formatted as {crate_name}_{crate_type} (e.g., "my_lib_lib", "my_bin_bin")
+                            // We skip the binary (_bin) of the main package since it gets compiled by the thin build,
+                            // but we still compile the library (_lib) even if it's in the main package
+                            let lib_key = format!("{}_lib", crate_name);
+                            let rlib_key = format!("{}_rlib", crate_name);
+                            
+                            // For the main package, we only compile the library, not the binary
+                            // For other packages, we compile any library crates
+                            if krate.name == self.package().name {
+                                // Main package: only compile the library crate if it exists
+                                if workspace_rustc_args.contains_key(&lib_key) {
+                                    crates_to_compile.insert(lib_key);
+                                } else if workspace_rustc_args.contains_key(&rlib_key) {
+                                    crates_to_compile.insert(rlib_key);
+                                }
+                            } else {
+                                // Other packages: compile any library crates
+                                if workspace_rustc_args.contains_key(&lib_key) {
+                                    crates_to_compile.insert(lib_key);
+                                } else if workspace_rustc_args.contains_key(&rlib_key) {
+                                    crates_to_compile.insert(rlib_key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if crates_to_compile.is_empty() {
+            tracing::debug!("No workspace crates to compile for hot-patching");
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "Compiling {} workspace crate(s) for hot-patching: {:?}",
+            crates_to_compile.len(),
+            crates_to_compile
+        );
+
+        // Compile each affected workspace crate
+        for crate_name in crates_to_compile {
+            if let Some(rustc_args) = workspace_rustc_args.get(&crate_name) {
+                self.compile_workspace_crate(ctx, &crate_name, rustc_args)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Compile a single workspace crate using its cached rustc args.
+    async fn compile_workspace_crate(
+        &self,
+        _ctx: &BuildContext,
+        crate_name: &str,
+        rustc_args: &RustcArgs,
+    ) -> Result<()> {
+        tracing::debug!("Compiling workspace crate for hot-patching: {}", crate_name);
+
+        let mut cmd = Command::new("rustc");
+        cmd.current_dir(self.workspace_dir());
+        cmd.env_clear();
+        cmd.args(rustc_args.args[1..].iter());
+        cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
+        cmd.env_remove("RUSTC_WRAPPER");
+        cmd.env_remove(DX_RUSTC_WRAPPER_ENV_VAR);
+        cmd.env_remove(DX_RUSTC_WORKSPACE_WRAPPER_ENV_VAR);
+        cmd.envs(rustc_args.envs.iter().cloned());
+
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .context(format!(
+                "Failed to compile workspace crate: {}",
+                crate_name
+            ))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                "Failed to compile workspace crate {}: {}",
+                crate_name,
+                stderr
+            );
+            bail!(
+                "Failed to compile workspace crate {}: {}",
+                crate_name,
+                stderr
+            );
+        }
+
+        tracing::debug!("Successfully compiled workspace crate: {}", crate_name);
+        Ok(())
     }
 
     /// Collect the assets from the final executable and modify the binary in place to point to the right
@@ -1704,6 +1856,79 @@ impl BuildRequest {
             .sorted()
             .map(PathBuf::from)
             .collect::<Vec<_>>();
+
+        // For workspace library crates that were recompiled, we need to include their object files
+        // in the patch. These object files are separate from the binary's .rcgu.o files.
+        // The library's object files are saved by -Csave-temps in the same directory as the rlib.
+        if let BuildMode::Thin { workspace_rustc_args, changed_files, .. } = &ctx.mode {
+            tracing::debug!("Checking for workspace lib object files to include in patch");
+            tracing::trace!("workspace_rustc_args keys: {:?}", workspace_rustc_args.keys().collect::<Vec<_>>());
+            // Find workspace library rlibs that might have been recompiled
+            for arg in args.iter() {
+                if arg.ends_with(".rlib") {
+                    let rlib_path = PathBuf::from(arg);
+                    if let Some(file_stem) = rlib_path.file_stem().and_then(|s| s.to_str()) {
+                        // Extract crate name from rlib filename (e.g., "libtest_hotpatching-598ff520a763db31")
+                        if let Some(crate_name_with_hash) = file_stem.strip_prefix("lib") {
+                            let crate_name = crate_name_with_hash.split('-').next().unwrap_or("");
+                            // Check if we have rustc args for this crate (meaning it's a workspace crate)
+                            let lib_key = format!("{}_lib", crate_name);
+                            tracing::trace!("Checking rlib {} with lib_key {}", crate_name_with_hash, lib_key);
+                            if workspace_rustc_args.contains_key(&lib_key) {
+                                tracing::debug!("Found workspace lib crate: {} (lib_key: {})", crate_name, lib_key);
+                                // Check if any changed files belong to this crate
+                                let crate_changed = changed_files.iter().any(|f| {
+                                    // Simple heuristic: check if any member's directory matches
+                                    self.workspace.krates.workspace_members().any(|member| {
+                                        if let krates::Node::Krate { krate, .. } = member {
+                                            if krate.name.replace('-', "_") == crate_name {
+                                                if let Some(crate_dir) = krate.manifest_path.parent() {
+                                                    return f.starts_with(crate_dir.as_std_path());
+                                                }
+                                            }
+                                        }
+                                        false
+                                    })
+                                });
+
+                                tracing::debug!("Crate {} changed: {}", crate_name, crate_changed);
+                                if crate_changed {
+                                    // Extract object files from the rlib archive
+                                    // The rlib contains only the object files from the latest compilation
+                                    if let Some(deps_dir) = rlib_path.parent() {
+                                        tracing::debug!("Extracting object files from rlib: {:?}", rlib_path);
+                                        
+                                        // Use 'ar' to list the contents of the rlib
+                                        if let Ok(output) = std::process::Command::new("ar")
+                                            .args(["-t", &rlib_path.display().to_string()])
+                                            .output()
+                                        {
+                                            if output.status.success() {
+                                                let listing = String::from_utf8_lossy(&output.stdout);
+                                                let mut found_count = 0;
+                                                for line in listing.lines() {
+                                                    if line.ends_with(".rcgu.o") {
+                                                        let obj_path = deps_dir.join(line);
+                                                        if obj_path.exists() && !object_files.contains(&obj_path) {
+                                                            tracing::debug!("Adding workspace lib object file from rlib: {:?}", obj_path);
+                                                            object_files.push(obj_path);
+                                                            found_count += 1;
+                                                        }
+                                                    }
+                                                }
+                                                tracing::debug!("Found {} workspace lib object files for {} from rlib", found_count, crate_name);
+                                            } else {
+                                                tracing::warn!("Failed to list rlib contents: {:?}", String::from_utf8_lossy(&output.stderr));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // On non-wasm platforms, we generate a special shim object file which converts symbols from
         // fat binary into direct addresses from the running process.
@@ -2566,15 +2791,24 @@ impl BuildRequest {
                     .envs(env.iter().map(|(k, v)| (k.as_ref(), v)));
 
                 if matches!(build_mode, BuildMode::Fat | BuildMode::Base { run: true }) {
+                    // Use RUSTC_WORKSPACE_WRAPPER to capture rustc args for all workspace crates
+                    // This enables hot-patching of library crates, not just the top-level binary
+                    // We use RUSTC_WORKSPACE_WRAPPER instead of RUSTC_WRAPPER because:
+                    // 1. We only need args for workspace crates (not external deps)
+                    // 2. Using both wrappers causes issues with cargo's wrapper chaining
+                    let workspace_args_dir = self.workspace_rustc_args_dir();
+                    // Ensure the directory exists before canonicalizing
+                    std::fs::create_dir_all(&workspace_args_dir)
+                        .context("Failed to create workspace rustc args directory")?;
                     cmd.env(
-                        DX_RUSTC_WRAPPER_ENV_VAR,
-                        dunce::canonicalize(self.rustc_wrapper_args_file())
-                            .context("Failed to canonicalize rustc wrapper args file")?
+                        DX_RUSTC_WORKSPACE_WRAPPER_ENV_VAR,
+                        dunce::canonicalize(&workspace_args_dir)
+                            .context("Failed to canonicalize workspace rustc args dir")?
                             .display()
                             .to_string(),
                     );
                     cmd.env(
-                        "RUSTC_WRAPPER",
+                        "RUSTC_WORKSPACE_WRAPPER",
                         Workspace::path_to_dx()?.display().to_string(),
                     );
                 }
@@ -3490,6 +3724,11 @@ impl BuildRequest {
 
     pub(crate) fn rustc_wrapper_args_file(&self) -> PathBuf {
         self.session_cache_dir().join("rustc_wrapper_args.txt")
+    }
+
+    /// Directory where workspace crate rustc args are stored (one file per crate).
+    pub(crate) fn workspace_rustc_args_dir(&self) -> PathBuf {
+        self.session_cache_dir().join("workspace_rustc_args")
     }
 
     fn link_err_file(&self) -> PathBuf {

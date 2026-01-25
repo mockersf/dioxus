@@ -76,6 +76,9 @@ impl HotpatchTip {
                 envs: rustc_envs,
                 link_args,
             },
+            // For the CLI hotpatch command, we don't have workspace rustc args
+            // since this is used for standalone patching scenarios
+            workspace_rustc_args: Default::default(),
             changed_files: vec![],
             aslr_reference: self.aslr_reference,
             cache: cache.clone(),

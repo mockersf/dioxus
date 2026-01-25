@@ -363,6 +363,7 @@ impl AppBuilder {
                 mode: BuildMode::Thin {
                     changed_files,
                     rustc_args: artifacts.direct_rustc,
+                    workspace_rustc_args: artifacts.workspace_rustc_args,
                     aslr_reference,
                     cache,
                 },
