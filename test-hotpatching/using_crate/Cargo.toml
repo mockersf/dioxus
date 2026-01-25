@@ -1,0 +1,8 @@
+[package]
+name = "using_crate"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+other_crate = { path = "../other_crate" }
+transitive_crate = { path = "../transitive_crate"}

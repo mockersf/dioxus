@@ -224,6 +224,9 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                • To restart the app, press `r` to rebuild or `o` to open
                • To exit the server, press `ctrl+c`"#
                             );
+                            if exit_on_error {
+                                return Ok(());
+                            }
                         } else {
                             tracing::error!(
                                 "Application [{bundle_format}] exited with error: {status}"

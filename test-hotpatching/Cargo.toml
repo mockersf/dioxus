@@ -1,0 +1,9 @@
+[package]
+name = "test-hotpatching"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dioxus-devtools = { path = "../packages/devtools" }
+other_crate = { path = "other_crate" }
+using_crate = { path = "using_crate" }

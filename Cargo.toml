@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
+    "test-hotpatching",
+    "test-hotpatching/other_crate",
+    "test-hotpatching/transitive_crate",
+    "test-hotpatching/using_crate",
+    "test-hotpatching/with-bevy",
+    "test-hotpatching/bevy-dependency",
     "packages/dioxus",
     "packages/core",
     "packages/core-types",
@@ -998,3 +1004,7 @@ doc-scrape-examples = true
 [[example]]
 name = "__scrape_example_list"
 path = "examples/scripts/scrape_examples.rs"
+
+[patch.crates-io]
+subsecond = { path = "packages/subsecond/subsecond" }
+subsecond-types = { path = "packages/subsecond/subsecond-types" }
