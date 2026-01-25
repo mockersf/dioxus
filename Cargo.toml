@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "test-hotpatching",
     "packages/dioxus",
     "packages/core",
     "packages/core-types",
