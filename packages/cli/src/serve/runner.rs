@@ -407,10 +407,18 @@ impl AppServer {
                     continue;
                 };
 
-                // Get the cached file if it exists - ignoring if it doesn't exist
+                // Get the cached file if it exists
+                // If the file is not in the filemap but is in a workspace crate, we still need to rebuild
                 let Some(cached_file) = self.file_map.get_mut(path) else {
                     tracing::debug!("No entry for file in filemap: {:?}", path);
-                    tracing::debug!("Filemap: {:#?}", self.file_map.keys());
+                    // Check if this file is within the workspace root - if so, it might be
+                    // a library crate that needs hot-patching even if we can't diff RSX
+                    if path.starts_with(self.workspace.workspace_root()) {
+                        tracing::debug!(
+                            "File is in workspace, triggering full rebuild for hot-patching"
+                        );
+                        needs_full_rebuild = true;
+                    }
                     continue;
                 };
 
