@@ -163,6 +163,13 @@ pub(crate) async fn serve_all(args: ServeArgs, tracer: &TraceController) -> Resu
                         screen.push_cargo_log(message);
                     }
                     BuilderUpdate::BuildFailed { err } => {
+                        // "No changes to compile" is not a real error - it just means rustc
+                        // decided nothing needed recompilation (e.g., duplicate file change events)
+                        if err.to_string().contains("No changes to compile") {
+                            tracing::debug!("Skipping patch - no changes to compile");
+                            continue;
+                        }
+
                         tracing::error!(
                             "{ERROR_STYLE}Build failed{ERROR_STYLE:#}: {}",
                             crate::error::log_stacktrace(&err, 15),
