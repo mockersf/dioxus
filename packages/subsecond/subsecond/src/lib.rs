@@ -305,7 +305,19 @@ pub unsafe fn get_jump_table() -> Option<&'static JumpTable> {
 
     Some(unsafe { &*ptr })
 }
-unsafe fn commit_patch(table: JumpTable) {
+unsafe fn commit_patch(mut table: JumpTable) {
+    // Merge new jump table entries with existing ones, preserving entries that aren't overwritten.
+    // This is critical for multi-crate hot-patching: when patching the binary crate again after
+    // patching a dependency crate, we need to preserve the dependency's mappings.
+    let existing_ptr = APP_JUMP_TABLE.load(std::sync::atomic::Ordering::Relaxed);
+    if !existing_ptr.is_null() {
+        let existing = unsafe { &*existing_ptr };
+        // Start with existing mappings, then overlay new ones
+        let mut merged_map = existing.map.clone();
+        merged_map.extend(table.map.iter());
+        table.map = merged_map;
+    }
+
     APP_JUMP_TABLE.store(
         Box::into_raw(Box::new(table)),
         std::sync::atomic::Ordering::Relaxed,
@@ -505,9 +517,24 @@ pub unsafe fn apply_patch(mut table: JumpTable) -> Result<(), PatchError> {
 
         #[cfg(not(target_os = "android"))]
         let lib = Box::leak(Box::new({
-            match libloading::Library::new(&table.lib) {
-                Ok(lib) => lib,
-                Err(err) => return Err(PatchError::Dlopen(err.to_string())),
+            // Use RTLD_GLOBAL so that symbols from this dylib are available for resolving
+            // undefined symbols in subsequently loaded dylibs. This is needed for multi-crate
+            // hot-patching where patch N+1 may have undefined references to symbols defined
+            // in patch N (from previously-patched workspace crates).
+            #[cfg(unix)]
+            {
+                use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_LAZY};
+                match unsafe { Library::open(Some(&table.lib), RTLD_LAZY | RTLD_GLOBAL) } {
+                    Ok(lib) => libloading::Library::from(lib),
+                    Err(err) => return Err(PatchError::Dlopen(err.to_string())),
+                }
+            }
+            #[cfg(windows)]
+            {
+                match libloading::Library::new(&table.lib) {
+                    Ok(lib) => lib,
+                    Err(err) => return Err(PatchError::Dlopen(err.to_string())),
+                }
             }
         }));
 
