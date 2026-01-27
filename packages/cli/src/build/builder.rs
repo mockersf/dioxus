@@ -755,10 +755,13 @@ impl AppBuilder {
         let changed_file = changed_files.first().unwrap();
         tracing::info!(
             "Hot-patching: {NOTE_STYLE}{}{NOTE_STYLE:#} took {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}",
-            changed_file
-                .display()
-                .to_string()
-                .trim_start_matches(&self.build.crate_dir().display().to_string()),
+            pathdiff::diff_paths(changed_file, &self.build.crate_dir())
+                .map(|relative_path| relative_path.display().to_string())
+                .unwrap_or_else(|| changed_file
+                    .display()
+                    .to_string()
+                    .trim_start_matches(&self.build.crate_dir().display().to_string())
+                    .to_string()),
             SystemTime::now()
                 .duration_since(res.time_start)
                 .unwrap()
