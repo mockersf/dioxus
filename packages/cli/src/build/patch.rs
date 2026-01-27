@@ -78,6 +78,7 @@ pub struct HotpatchModuleCache {
     pub symbol_table: HashMap<String, CachedSymbol>,
 }
 
+#[derive(Debug)]
 pub struct CachedSymbol {
     pub address: u64,
     pub kind: SymbolKind,
@@ -348,6 +349,7 @@ pub fn create_native_jump_table(
     patch: &Path,
     triple: &Triple,
     cache: &HotpatchModuleCache,
+    stubbed_symbols: &[String],
 ) -> Result<JumpTable> {
     let old_name_to_addr = &cache.symbol_table;
     let obj2_bytes = std::fs::read(patch)?;
@@ -355,17 +357,97 @@ pub fn create_native_jump_table(
     let mut map = AddressMap::default();
     let new_syms = obj2.symbol_map();
 
+    // Convert stubbed symbols to a HashSet for fast lookup
+    let stubbed_set: HashSet<&str> = stubbed_symbols.iter().map(|s| s.as_str()).collect();
+
     let new_name_to_addr = new_syms
         .symbols()
         .par_iter()
         .map(|s| (s.name(), s.address()))
         .collect::<HashMap<_, _>>();
 
+    let mut skipped_stubbed = 0;
     for (new_name, new_addr) in new_name_to_addr.iter() {
+        // Skip stubbed symbols - they just redirect to the original binary and should NOT
+        // create jump table entries. This prevents overwriting mappings from previous patches
+        // that have actual new code.
+        if stubbed_set.contains(*new_name) {
+            skipped_stubbed += 1;
+            tracing::debug!("Skipping stubbed symbol: {}", new_name);
+            continue;
+        }
+
         if let Some(old_addr) = old_name_to_addr.get(*new_name) {
             map.insert(old_addr.address, *new_addr);
         }
     }
+    tracing::debug!(
+        "Jump table exact matches: skipped {} stubbed, added {} entries",
+        skipped_stubbed,
+        map.len()
+    );
+
+    // Handle workspace library symbols with changed hashes
+    // When a workspace crate is recompiled, its symbols get new hashes but the same demangled name.
+    // We need to map the old symbol (with old hash) to the new symbol (with new hash).
+    // Strip the hash suffix (17h{16 hex digits}E) and match by base name.
+    fn strip_rust_hash(name: &str) -> Option<&str> {
+        // Rust v0 mangled symbols end with "17h{16 hex chars}E"
+        // e.g., _ZN16test_hotpatching5hello17h8cd856c12a0202c3E
+        // The suffix is 20 chars: "17h" (3) + 16 hex chars + "E" (1)
+        if name.len() > 20 && name.ends_with('E') {
+            let suffix_start = name.len() - 20;
+            if name[suffix_start..].starts_with("17h")
+                && name[suffix_start + 3..name.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(&name[..suffix_start]);
+            }
+        }
+        None
+    }
+
+    // Build a set of old symbol names for quick lookup
+    let old_names: HashSet<&str> = old_name_to_addr.keys().map(|s| s.as_str()).collect();
+
+    // Build a map from base name (without hash) to new addresses for symbols that DON'T exist in the old binary
+    // This finds newly compiled symbols (with new hashes) that replace old symbols (with old hashes)
+    let mut new_code_by_base: HashMap<&str, u64> = HashMap::new();
+    for (name, addr) in new_name_to_addr.iter() {
+        // Only consider symbols that don't have an exact match in the old binary
+        // (those are likely the new versions with different hashes)
+        if !old_names.contains(*name) {
+            if let Some(base) = strip_rust_hash(name) {
+                new_code_by_base.insert(base, *addr);
+            }
+        }
+    }
+
+    // For each old symbol, check if there's a new symbol with the same base name but different hash.
+    // This OVERRIDES exact matches because when a workspace lib is recompiled:
+    // - The old symbol (with old hash) gets a stub in the patch pointing back to the main binary
+    // - The new symbol (with new hash) contains the actual new code
+    // We want to redirect to the new code, not the stub!
+    let mut hash_independent_count = 0;
+    for (old_name, old_sym) in old_name_to_addr.iter() {
+        if let Some(old_base) = strip_rust_hash(old_name) {
+            if let Some(&new_addr) = new_code_by_base.get(old_base) {
+                // Found a match with different hash - this is a recompiled workspace lib symbol
+                // Override any existing mapping to point to the new code instead of a stub
+                hash_independent_count += 1;
+                map.insert(old_sym.address, new_addr);
+            }
+        }
+    }
+    if hash_independent_count > 0 {
+        tracing::trace!(
+            "Hash-independent mappings added: {}",
+            hash_independent_count
+        );
+    }
+
+    tracing::trace!("Jump table size: {} entries", map.len());
 
     let sentinel = main_sentinel(triple);
     let new_base_address = new_name_to_addr
@@ -377,6 +459,12 @@ pub fn create_native_jump_table(
         .map(|s| s.address)
         .context("failed to find 'main' symbol in original module - are debug symbols enabled?")?;
 
+    tracing::debug!(
+        "Jump table: aslr_reference={:#x}, new_base_address={:#x}",
+        aslr_reference,
+        new_base_address
+    );
+
     Ok(JumpTable {
         lib: patch.to_path_buf(),
         map,
@@ -386,6 +474,10 @@ pub fn create_native_jump_table(
     })
 }
 
+/// Check if a symbol should be skipped because it belongs to a workspace library crate
+/// that wasn't recompiled during this patch.
+///
+/// When only the binary crate is patched (and workspace libs aren't recompiled), symbols
 /// In the web, our patchable functions are actually ifuncs
 ///
 /// We need to line up the ifuncs from the main module to the ifuncs in the patch.
@@ -778,31 +870,102 @@ fn collect_func_ifuncs(m: &Module) -> HashMap<&str, i32> {
 /// Note - this function is not defined to run on WASM binaries. The `object` crate does not
 ///
 /// todo... we need to wire up the cache
+/// Returns (stub_bytes, symbol_aliases, stubbed_symbols) where:
+/// - symbol_aliases is a list of (old_name, new_name) pairs for symbols that should be aliased
+/// - stubbed_symbols is a list of symbol names that were stubbed (pointing back to original binary)
+///   These should NOT create jump table entries since they're just passthroughs.
 pub fn create_undefined_symbol_stub(
     cache: &HotpatchModuleCache,
     incrementals: &[PathBuf],
     triple: &Triple,
     aslr_reference: u64,
-) -> Result<Vec<u8>> {
+    stale_workspace_crates: &HashSet<String>,
+) -> Result<(Vec<u8>, Vec<(String, String)>, Vec<String>)> {
     let sorted: Vec<_> = incrementals.iter().sorted().collect();
 
     // Find all the undefined symbols in the incrementals
     let mut undefined_symbols = HashSet::new();
     let mut defined_symbols = HashSet::new();
 
+    // Track which symbols we stub (these should not create jump table entries)
+    let mut stubbed_symbols: Vec<String> = Vec::new();
+
     for path in sorted {
         let bytes = std::fs::read(path).with_context(|| format!("failed to read {path:?}"))?;
         let file = File::parse(bytes.deref() as &[u8])?;
         for symbol in file.symbols() {
+            let name = symbol.name()?;
             if symbol.is_undefined() {
-                undefined_symbols.insert(symbol.name()?.to_string());
+                undefined_symbols.insert(name.to_string());
             } else if symbol.is_global() {
-                defined_symbols.insert(symbol.name()?.to_string());
+                defined_symbols.insert(name.to_string());
             }
         }
     }
+
+    // Helper function to strip Rust symbol hash suffix
+    fn strip_rust_hash(name: &str) -> Option<&str> {
+        // Rust v0 mangled symbols end with "17h{16 hex chars}E"
+        // e.g., _ZN16test_hotpatching5hello17h8cd856c12a0202c3E
+        // The suffix is 20 chars: "17h" (3) + 16 hex chars + "E" (1)
+        if name.len() > 20 && name.ends_with('E') {
+            let suffix_start = name.len() - 20;
+            if name[suffix_start..].starts_with("17h")
+                && name[suffix_start + 3..name.len() - 1]
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
+            {
+                return Some(&name[..suffix_start]);
+            }
+        }
+        None
+    }
+
+    // Build a map from base name (without hash) to full defined symbol name
+    let mut defined_by_base: HashMap<&str, &str> = HashMap::new();
+    for sym in defined_symbols.iter() {
+        if let Some(base) = strip_rust_hash(sym) {
+            defined_by_base.insert(base, sym);
+        }
+    }
+
+    // Also build a map from base name to symbols in the main binary's symbol table
+    // This handles external dependencies where symbols have different hashes
+    // Both object files and the binary use the same symbol naming convention on each platform
+    let mut cache_by_base: HashMap<String, String> = HashMap::new();
+    for (sym_name, sym) in cache.symbol_table.iter() {
+        if !sym.is_undefined {
+            if let Some(base) = strip_rust_hash(sym_name) {
+                // Use the symbol name directly - no prefix modification needed
+                cache_by_base.insert(base.to_string(), sym_name.clone());
+            }
+        }
+    }
+
+    // Collect symbol aliases: (old_undefined_name, new_defined_name)
+    // These are for symbols where we have a new definition with a different hash
+    let mut symbol_aliases: Vec<(String, String)> = Vec::new();
+
+    // Filter undefined symbols:
+    // 1. Remove symbols that are directly defined
+    // 2. For symbols with a defined symbol of the same base name but different hash,
+    //    don't create a stub - instead add an alias so the linker resolves them
+    // 3. For symbols from external dependencies, check if the main binary has a matching symbol
     let undefined_symbols: Vec<_> = undefined_symbols
         .difference(&defined_symbols)
+        .filter(|sym| {
+            // Check if there's a defined symbol with the same base name in patch object files
+            if let Some(base) = strip_rust_hash(sym) {
+                if let Some(&new_name) = defined_by_base.get(base) {
+                    tracing::trace!("Creating alias (patch): {} -> {}", sym, new_name);
+                    symbol_aliases.push(((*sym).clone(), new_name.to_string()));
+                    return false; // Don't create a stub, use the alias instead
+                }
+                // Note: for external dependency symbols (where cache has a matching symbol with different hash),
+                // we let them fall through to the stub creation loop which will look them up by base name
+            }
+            true
+        })
         .cloned()
         .collect();
 
@@ -875,15 +1038,71 @@ pub fn create_undefined_symbol_stub(
 
     let aslr_offset = aslr_reference - aslr_ref_address;
 
+    // Helper to extract crate name from a Rust mangled symbol.
+    // Symbols look like: _ZN15bevy_dependency13move_the_cube17h...E or __ZN15bevy_dependency13move_the_cube17h...E
+    // The crate name comes right after "_ZN" + length prefix.
+    fn extract_crate_name(name: &str) -> Option<&str> {
+        // Find the start of the mangled name after underscores
+        let mangled = name.trim_start_matches('_');
+        if !mangled.starts_with("ZN") {
+            return None;
+        }
+        let rest = &mangled[2..]; // Skip "ZN"
+
+        // Parse the length prefix (digits)
+        let len_end = rest.find(|c: char| !c.is_ascii_digit())?;
+        let len: usize = rest[..len_end].parse().ok()?;
+
+        // Extract the crate name
+        let crate_name = &rest[len_end..][..len];
+        Some(crate_name)
+    }
+
     // we need to assemble a PLT/GOT so direct calls to the patch symbols work
     // for each symbol we either write the address directly (as a symbol) or create a PLT/GOT entry
     let text_section = obj.section_id(StandardSection::Text);
+
     for name in undefined_symbols {
-        let Some(sym) = cache
+        // Check if this symbol belongs to a stale workspace crate.
+        // If so, don't create a stub - leave it undefined so the runtime linker
+        // resolves it against the previously-loaded patch dylib.
+        if let Some(crate_name) = extract_crate_name(&name) {
+            if stale_workspace_crates.contains(crate_name) {
+                tracing::trace!(
+                    "Skipping stub for symbol from previously-patched crate '{}': {}",
+                    crate_name,
+                    name
+                );
+                continue;
+            }
+        }
+
+        // Try exact match first
+        let sym = cache
             .symbol_table
             .get(name.as_str().trim_start_matches("__imp_"))
-        else {
-            tracing::debug!("Symbol not found: {}", name);
+            // If exact match fails, try matching by base name (without hash suffix)
+            // This handles external dependency symbols that have different hashes
+            .or_else(|| {
+                if let Some(base) = strip_rust_hash(&name) {
+                    cache_by_base.get(base).and_then(|cached_name| {
+                        let result = cache.symbol_table.get(cached_name);
+                        if result.is_some() {
+                            tracing::trace!(
+                                "Found symbol by base name: {} -> {}",
+                                name,
+                                cached_name
+                            );
+                        }
+                        result
+                    })
+                } else {
+                    None
+                }
+            });
+
+        let Some(sym) = sym else {
+            tracing::trace!("Symbol not found: {}", name);
             continue;
         };
 
@@ -893,8 +1112,9 @@ pub fn create_undefined_symbol_stub(
             continue;
         }
 
-        // ld64 likes to prefix symbols in intermediate object files with an underscore, but our symbol
-        // table doesn't, so we need to strip it off.
+        // ld64 likes to prefix symbols in intermediate object files with an underscore.
+        // The `object` crate also adds an underscore prefix when writing MachO symbols.
+        // So we need to strip one underscore to avoid double-prefixing.
         let name_offset = match triple.operating_system {
             OperatingSystem::MacOSX(_) | OperatingSystem::Darwin(_) | OperatingSystem::IOS(_) => 1,
             _ => 0,
@@ -1057,6 +1277,9 @@ pub fn create_undefined_symbol_stub(
                     },
                 };
                 let offset = obj.append_section_data(text_section, &jump_asm, 8);
+                // Important: Use the ORIGINAL name from the object file, not the stripped one!
+                // The stub symbol must match the undefined reference exactly for the linker to resolve it.
+                // name_offset is only for cache lookup, not for the stub symbol itself.
                 obj.add_symbol(Symbol {
                     name: name.as_bytes()[name_offset..].to_vec(),
                     value: offset,
@@ -1067,6 +1290,8 @@ pub fn create_undefined_symbol_stub(
                     section: SymbolSection::Section(text_section),
                     flags: SymbolFlags::None, // ignore for these stubs
                 });
+                // Track this as a stubbed symbol - it should not create a jump table entry
+                stubbed_symbols.push(name.clone());
             }
 
             // Rust code typically generates Tls accessors as functions (text), but they are referenced
@@ -1168,7 +1393,7 @@ pub fn create_undefined_symbol_stub(
         }
     }
 
-    Ok(obj.write()?)
+    Ok((obj.write()?, symbol_aliases, stubbed_symbols))
 }
 
 /// Prepares the base module before running wasm-bindgen.
