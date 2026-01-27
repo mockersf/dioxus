@@ -76,9 +76,14 @@ impl HotpatchTip {
                 envs: rustc_envs,
                 link_args,
             },
+            // For the CLI hotpatch command, we don't have workspace rustc args
+            // since this is used for standalone patching scenarios
+            workspace_rustc_args: Default::default(),
             changed_files: vec![],
             aslr_reference: self.aslr_reference,
             cache: cache.clone(),
+            // CLI hotpatch command doesn't track previous patches
+            patched_workspace_crates: std::collections::HashSet::new(),
         };
 
         let artifacts = AppBuilder::started(request, mode, build_id)?
@@ -87,7 +92,9 @@ impl HotpatchTip {
         let patch_exe = request.patch_exe(artifacts.time_start);
 
         Ok(StructuredOutput::Hotpatch {
-            jump_table: request.create_jump_table(&patch_exe, &cache)?,
+            // Note: empty stubbed_symbols and recompiled_workspace_crates for CLI
+            // - it doesn't support multi-crate hot-patching
+            jump_table: request.create_jump_table(&patch_exe, &cache, &[])?,
             artifacts: artifacts.into_structured_output(),
         })
     }

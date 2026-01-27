@@ -5539,6 +5539,7 @@ dependencies = [
  "object 0.37.3",
  "open",
  "path-absolutize",
+ "pathdiff",
  "pdb",
  "plist",
  "posthog-rs",

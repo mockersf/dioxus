@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Error};
 use dioxus_cli_opt::process_file_to;
 use futures_util::{future::OptionFuture, pin_mut, FutureExt};
 use itertools::Itertools;
+use std::collections::HashSet;
 use std::{
     env,
     time::{Duration, Instant, SystemTime},
@@ -66,6 +67,10 @@ pub(crate) struct AppBuilder {
     /// The list of patches applied to the app, used to know which ones to reapply and/or iterate from.
     pub patches: Vec<JumpTable>,
     pub patch_cache: Option<HotpatchModuleCache>,
+
+    /// Workspace crates that have been patched (their code exists in a previously-loaded patch dylib).
+    /// Used to determine which symbols should be left undefined for runtime resolution.
+    pub patched_workspace_crates: HashSet<String>,
 
     /// The virtual directory that assets will be served from
     /// Used mostly for apk/ipa builds since they live in simulator
@@ -140,6 +145,7 @@ impl AppBuilder {
             tx,
             rx,
             patches: vec![],
+            patched_workspace_crates: HashSet::new(),
             compiled_crates: 0,
             expected_crates: 1,
             bundling_progress: 0.0,
@@ -357,14 +363,17 @@ impl AppBuilder {
         self.abort_all(BuildStage::Restarting);
         self.build_task = tokio::spawn({
             let request = self.build.clone();
+            let patched_crates = self.patched_workspace_crates.clone();
             let ctx = BuildContext {
                 build_id,
                 tx: self.tx.clone(),
                 mode: BuildMode::Thin {
                     changed_files,
                     rustc_args: artifacts.direct_rustc,
+                    workspace_rustc_args: artifacts.workspace_rustc_args,
                     aslr_reference,
                     cache,
+                    patched_workspace_crates: patched_crates,
                 },
             };
             async move { request.build(&ctx).await }
@@ -720,7 +729,14 @@ impl AppBuilder {
 
         tracing::debug!("Patching {} -> {}", original.display(), new.display());
 
-        let mut jump_table = self.build.create_jump_table(&new, cache)?;
+        // Track which workspace crates have been patched so future patches know to leave
+        // those symbols undefined for runtime resolution against the already-loaded dylibs.
+        self.patched_workspace_crates
+            .extend(res.recompiled_workspace_crates.iter().cloned());
+
+        let mut jump_table = self
+            .build
+            .create_jump_table(&new, cache, &res.stubbed_symbols)?;
 
         // If it's android, we need to copy the assets to the device and then change the location of the patch
         if self.build.bundle == BundleFormat::Android {
@@ -739,10 +755,13 @@ impl AppBuilder {
         let changed_file = changed_files.first().unwrap();
         tracing::info!(
             "Hot-patching: {NOTE_STYLE}{}{NOTE_STYLE:#} took {GLOW_STYLE}{:?}ms{GLOW_STYLE:#}",
-            changed_file
-                .display()
-                .to_string()
-                .trim_start_matches(&self.build.crate_dir().display().to_string()),
+            pathdiff::diff_paths(changed_file, &self.build.crate_dir())
+                .map(|relative_path| relative_path.display().to_string())
+                .unwrap_or_else(|| changed_file
+                    .display()
+                    .to_string()
+                    .trim_start_matches(&self.build.crate_dir().display().to_string())
+                    .to_string()),
             SystemTime::now()
                 .duration_since(res.time_start)
                 .unwrap()
