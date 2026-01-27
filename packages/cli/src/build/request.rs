@@ -2123,17 +2123,17 @@ impl BuildRequest {
             }
         }
 
-        // Debug: log what object files we have before filtering
-        tracing::info!(
-            "Object files before stale filtering ({} total):",
-            object_files.len()
-        );
-        for obj in &object_files {
-            if let Some(fname) = obj.file_name().and_then(|s| s.to_str()) {
-                let crate_name = fname.split('-').next().unwrap_or("?");
-                tracing::info!("  - {} (crate: {})", fname, crate_name);
-            }
-        }
+        // // Debug: log what object files we have before filtering
+        // tracing::info!(
+        //     "Object files before stale filtering ({} total):",
+        //     object_files.len()
+        // );
+        // for obj in &object_files {
+        //     if let Some(fname) = obj.file_name().and_then(|s| s.to_str()) {
+        //         let crate_name = fname.split('-').next().unwrap_or("?");
+        //         tracing::info!("  - {} (crate: {})", fname, crate_name);
+        //     }
+        // }
 
         // Track workspace library rlibs that were NOT recompiled in THIS patch.
         // These contain stale code and should NOT be linked into the patch.
